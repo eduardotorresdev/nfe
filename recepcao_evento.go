@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,33 @@ type ManifestacaoEvento struct {
 }
 
 // ============================================================================
+// Modelo de saída semântica
+// ============================================================================
+
+type ManifestacaoEventoItem struct {
+	Ambiente          int       // tpAmb
+	CodigoOrgao       int       // cOrgao
+	CodigoStatus      int       // cStat
+	Motivo            string    // xMotivo
+	ChNFe             string    // chNFe
+	TipoEvento        string    // tpEvento
+	DescricaoEvento   string    // xEvento
+	NumeroSequencial  int       // nSeqEvento
+	DataRegistro      time.Time // dhRegEvento
+	VersaoAplicativo  string    // verAplic
+}
+
+type ManifestacaoEventoResponse struct {
+	LoteID           string                   // idLote
+	Ambiente         int                      // tpAmb
+	CodigoOrgao      int                      // cOrgao
+	CodigoStatus     int                      // cStat
+	Motivo           string                   // xMotivo
+	VersaoAplicativo string                   // verAplic
+	Eventos          []ManifestacaoEventoItem // retEvento[..].infEvento
+}
+
+// ============================================================================
 // Função pública: envia Manifestação de Evento
 // ============================================================================
 
@@ -60,21 +88,21 @@ func SendManifestacaoEvento(
 	idLote string,
 	eventos []ManifestacaoEvento,
 	optReq ...func(*http.Request),
-) ([]byte, error) {
+) (*ManifestacaoEventoResponse, []byte, error) {
 	if len(eventos) == 0 {
-		return nil, fmt.Errorf("nenhum evento informado")
+		return nil, nil, fmt.Errorf("nenhum evento informado")
 	}
 
 	// Carrega cert/key (PEM) para assinatura
 	certPEM, keyPEM, err := loadSigningCert(certPEMPath, keyPEMPath)
 	if err != nil {
-		return nil, fmt.Errorf("erro carregando cert/key: %w", err)
+		return nil, nil, fmt.Errorf("erro carregando cert/key: %w", err)
 	}
 
 	// 1) Monta envEvento (Document) já assinado
 	envDoc, err := buildEnvEventoDoc(idLote, eventos, certPEM, keyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("erro montando envEvento: %w", err)
+		return nil, nil, fmt.Errorf("erro montando envEvento: %w", err)
 	}
 
 	envXML, _ := envDoc.WriteToString()
@@ -99,7 +127,7 @@ func SendManifestacaoEvento(
 	soapDoc.SetRoot(env)
 	soapBytes, err := soapDoc.WriteToBytes()
 	if err != nil {
-		return nil, fmt.Errorf("erro gerando SOAP XML: %w", err)
+		return nil, nil, fmt.Errorf("erro gerando SOAP XML: %w", err)
 	}
 
 	fmt.Println("==== SOAP ENVIADO RecepcaoEvento ====")
@@ -109,7 +137,7 @@ func SendManifestacaoEvento(
 	// 3) Envia com o SEU http.Client
 	req, err := http.NewRequestWithContext(ctx, "POST", urlRecepcaoEvento, bytes.NewReader(soapBytes))
 	if err != nil {
-		return nil, fmt.Errorf("erro criando request HTTP: %w", err)
+		return nil, nil, fmt.Errorf("erro criando request HTTP: %w", err)
 	}
 	req.Header.Set("Content-Type", "text/xml; charset=utf-8")
 	req.Header.Set("SOAPAction", soapActionRecepcaoEvento)
@@ -120,7 +148,7 @@ func SendManifestacaoEvento(
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("erro na requisição HTTP: %w", err)
+		return nil, nil, fmt.Errorf("erro na requisição HTTP: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -131,10 +159,15 @@ func SendManifestacaoEvento(
 	fmt.Println("======================================")
 
 	if resp.StatusCode != http.StatusOK {
-		return respBody, fmt.Errorf("HTTP %d na RecepcaoEvento", resp.StatusCode)
+		return nil, respBody, fmt.Errorf("HTTP %d na RecepcaoEvento", resp.StatusCode)
 	}
 
-	return respBody, nil
+	sem, err := parseManifestacaoResp(respBody)
+	if err != nil {
+		return nil, respBody, fmt.Errorf("erro parse resposta RecepcaoEvento: %w", err)
+	}
+
+	return sem, respBody, nil
 }
 
 // ============================================================================
@@ -355,4 +388,101 @@ func parsePrivateKeyAndCert(certPEM, keyPEM []byte) (*rsa.PrivateKey, []byte, er
 	}
 
 	return rsaKey, cert.Raw, nil
+}
+
+// ============================================================================
+// Parse da resposta SOAP em estrutura semântica
+// ============================================================================
+
+type retEnvEventoXML struct {
+	IDLote   string          `xml:"idLote"`
+	TpAmb    string          `xml:"tpAmb"`
+	VerAplic string          `xml:"verAplic"`
+	COrgao   string          `xml:"cOrgao"`
+	CStat    string          `xml:"cStat"`
+	XMotivo  string          `xml:"xMotivo"`
+	RetEv    []retEventoXML  `xml:"retEvento"`
+}
+
+type retEventoXML struct {
+	Versao    string          `xml:"versao,attr"`
+	InfEvento infEventoRetXML `xml:"infEvento"`
+}
+
+type infEventoRetXML struct {
+	TpAmb       string `xml:"tpAmb"`
+	VerAplic    string `xml:"verAplic"`
+	COrgao      string `xml:"cOrgao"`
+	CStat       string `xml:"cStat"`
+	XMotivo     string `xml:"xMotivo"`
+	ChNFe       string `xml:"chNFe"`
+	TpEvento    string `xml:"tpEvento"`
+	XEvento     string `xml:"xEvento"`
+	NSeqEvento  string `xml:"nSeqEvento"`
+	DhRegEvento string `xml:"dhRegEvento"`
+}
+
+func parseManifestacaoResp(body []byte) (*ManifestacaoEventoResponse, error) {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				return nil, fmt.Errorf("retEnvEvento não encontrado na resposta")
+			}
+			return nil, err
+		}
+
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+
+		if start.Name.Local == "retEnvEvento" {
+			var raw retEnvEventoXML
+			if err := dec.DecodeElement(&raw, &start); err != nil {
+				return nil, err
+			}
+			return convertRetEnvToSemantic(&raw)
+		}
+	}
+}
+
+func convertRetEnvToSemantic(raw *retEnvEventoXML) (*ManifestacaoEventoResponse, error) {
+	resp := &ManifestacaoEventoResponse{
+		LoteID:           raw.IDLote,
+		Motivo:           raw.XMotivo,
+		VersaoAplicativo: raw.VerAplic,
+	}
+
+	resp.Ambiente, _ = strconv.Atoi(raw.TpAmb)
+	resp.CodigoOrgao, _ = strconv.Atoi(raw.COrgao)
+	resp.CodigoStatus, _ = strconv.Atoi(raw.CStat)
+
+	for _, ev := range raw.RetEv {
+		inf := ev.InfEvento
+		item := ManifestacaoEventoItem{
+			Motivo:          inf.XMotivo,
+			ChNFe:           inf.ChNFe,
+			TipoEvento:      inf.TpEvento,
+			DescricaoEvento: inf.XEvento,
+			VersaoAplicativo: inf.VerAplic,
+		}
+
+		item.Ambiente, _ = strconv.Atoi(inf.TpAmb)
+		item.CodigoOrgao, _ = strconv.Atoi(inf.COrgao)
+		item.CodigoStatus, _ = strconv.Atoi(inf.CStat)
+		item.NumeroSequencial, _ = strconv.Atoi(inf.NSeqEvento)
+
+		if inf.DhRegEvento != "" {
+			if t, err := time.Parse(time.RFC3339, inf.DhRegEvento); err == nil {
+				item.DataRegistro = t
+			}
+		}
+
+		resp.Eventos = append(resp.Eventos, item)
+	}
+
+	return resp, nil
 }
