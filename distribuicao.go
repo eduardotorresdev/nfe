@@ -71,6 +71,13 @@ type DocZip struct {
 // =========================================================
 
 func (req DistDFeInt) Consulta(client *http.Client, optReq ...func(req *http.Request)) (RetDistDFeInt, []byte, [][]byte, error) {
+	optReq = append(optReq, func(r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		fmt.Println("===== SOAP REQUEST =====")
+		fmt.Println(string(b))
+		fmt.Println("========================")
+		r.Body = io.NopCloser(bytes.NewReader(b)) // repõe body pro envio
+})
 
 	xmlfile, err := sendRequest(req, urlDistDFe, xmlnsDistDFe, soapActionDistDFe, client, optReq...)
 	if err != nil {
